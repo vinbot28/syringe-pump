@@ -1,57 +1,66 @@
+// cleaned up with gemini 
+
+//stallguard
+//syringe collision
+//mm definition between ticks
+
+#include <SPI.h>
+#include <TMC2130Stepper.h>
+#include <AccelStepper.h>
+
 #define EN_PIN 4 
 #define DIR_PIN 7 
 #define STEP_PIN 8 
 #define CS_PIN 10
 
-constexpr uint32_t steps_per_mm = 200 * 16 / 8;
+constexpr uint32_t steps_per_mm = 200 * 8 / 8;
 
 const byte numChars = 32;
 char receivedChars[numChars];
 char tempChars[numChars];
 
-//input values from master
+// input values from master
 float syringeID = 0.0;
 float flowrate = 0.0; // (mL/s)
 float mL_toPump = 0.0;
 
-//calculated values on slave
+// calculated values on slave
 float feedrate = 0.0; // (mm/s)
 float pumpLength = 0.0; // (mm)
 
 boolean newData = false;
 
-#include <TMC2130Stepper.h>
 TMC2130Stepper driver = TMC2130Stepper(EN_PIN, DIR_PIN, STEP_PIN, CS_PIN);
-
-#include <AccelStepper.h>
-AccelStepper stepper = AccelStepper(stepper.DRIVER, STEP_PIN, DIR_PIN);
+AccelStepper stepper = AccelStepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
 void setup() {
   SPI.begin();
-  Serial.begin(9600);
-  while(!Serial);
+  Serial.begin(115200); // 115200 prevents serial output from blocking motor timing
+  while (!Serial);
+
   pinMode(CS_PIN, OUTPUT);
   digitalWrite(CS_PIN, HIGH);
-  driver.begin();             // Initiate pins and registeries
-  driver.rms_current(600);    // Set stepper current to 600mA. The command is the same as command TMC2130.setCurrent(600, 0.11, 0.5);
-  driver.stealthChop(1);      // Enable extremely quiet stepping
-  driver.stealth_autoscale(1);
-  driver.microsteps(16);
 
-  stepper.setMaxSpeed(15*steps_per_mm); 
-  stepper.setAcceleration(500*steps_per_mm); 
+  driver.begin();             // Initiate pins and registers
+  driver.rms_current(600);    // Set stepper current to 600mA
+  driver.stealthChop(1);      // Enable silent stepping
+  driver.stealth_autoscale(1);
+  driver.microsteps(8);
+
+  stepper.setMaxSpeed(50 * steps_per_mm); 
+  stepper.setAcceleration(500 * steps_per_mm); 
   stepper.setEnablePin(EN_PIN);
   stepper.setPinsInverted(false, false, true);
   stepper.enableOutputs();
-  Serial.println("Input data as: <syringe inner diam(mm),flowrate(mL/s),target volume(mL).>\n");
+
+  Serial.println("Input data as: <syringe inner diam(mm),flowrate(mL/s),target volume(mL)>\n");
 }
 
 void loop() {
   recvWithStartEndMarkers();
+
   if (newData == true) {
     strcpy(tempChars, receivedChars);
-    // this temporary copy is necessary to protect the original data
-    //   because strtok() used in parseData() replaces the commas with \0
     parseData();
     calculate();
     runStepper();
@@ -59,19 +68,24 @@ void loop() {
     showParsedData();
     newData = false;
   }
+
   if (stepper.distanceToGo() == 0) {
     stepper.disableOutputs();  
-    stepper.stop();
+  } else {
+    stepper.runSpeed(); //run doesnt do at the commanded speed
   }
-  else {
-    stepper.runSpeed();
-  }
-    
 }
 
 void runStepper() {
-  stepper.setSpeed(feedrate);
-  stepper.move(pumpLength*steps_per_mm);
+  float targetSteps = pumpLength * steps_per_mm;
+  float speedStepsPerSec = feedrate * steps_per_mm; // Converts mm/s to steps/s
+
+  if (targetSteps < 0) {
+    speedStepsPerSec = -speedStepsPerSec;
+  }
+
+  stepper.move(targetSteps);
+  stepper.setSpeed(speedStepsPerSec);
   stepper.enableOutputs();
 }
 
@@ -93,36 +107,34 @@ void recvWithStartEndMarkers() {
           ndx = numChars - 1;
         }
       } else {
-        receivedChars[ndx] = '\0';  // terminate the string
+        receivedChars[ndx] = '\0';
         recvInProgress = false;
         ndx = 0;
         newData = true;
       }
-    }
-
-    else if (rc == startMarker) {
+    } else if (rc == startMarker) {
       recvInProgress = true;
     }
   }
 }
 
-void parseData() {  // split the data into its parts
-  char* strtokIndx;  // this is used by strtok() as an index
+void parseData() {
+  char* strtokIndx;
 
   strtokIndx = strtok(tempChars, ",");
-  syringeID = atof(strtokIndx);  // convert this part to a float
+  syringeID = atof(strtokIndx);
 
   strtokIndx = strtok(NULL, ",");
   flowrate = atof(strtokIndx);
-  flowrate *= 1000;
+  flowrate *= 1000; // convert mL/s to mm^3/s
 
   strtokIndx = strtok(NULL, ",");
   mL_toPump = atof(strtokIndx);
 }
 
 void calculate() {
-  feedrate = (4.0*flowrate)/(PI*pow(syringeID,2));
-  pumpLength = (4.0*1000*mL_toPump)/(PI*pow(syringeID,2));
+  feedrate = (4.0 * flowrate) / (PI * pow(syringeID, 2));              // mm/s
+  pumpLength = (4.0 * 1000.0 * mL_toPump) / (PI * pow(syringeID, 2)); // mm
 }
 
 void showParsedData() {
