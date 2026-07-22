@@ -1,6 +1,6 @@
-// cleaned up with gemini 
+// huge gemini assist 
 
-//stallguard
+//stallguard DONE
 //syringe collision
 //mm definition between ticks
 
@@ -13,7 +13,11 @@
 #define STEP_PIN 8 
 #define CS_PIN 10
 
-constexpr uint32_t steps_per_mm = 200 * 8 / 8;
+#define STALL_VALUE 35
+bool isStalled = false; // Flag to track stall status
+uint32_t moveStartTime = 0; // Tracks when the current move started
+
+constexpr uint32_t steps_per_mm = 200 * 16 / 8;
 
 const byte numChars = 32;
 char receivedChars[numChars];
@@ -30,29 +34,49 @@ float pumpLength = 0.0; // (mm)
 
 boolean newData = false;
 
-TMC2130Stepper driver = TMC2130Stepper(EN_PIN, DIR_PIN, STEP_PIN, CS_PIN);
+TMC2130Stepper driver = TMC2130Stepper(CS_PIN);
 AccelStepper stepper = AccelStepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
 void setup() {
   SPI.begin();
-  Serial.begin(115200); // 115200 prevents serial output from blocking motor timing
+  Serial.begin(115200);
   while (!Serial);
 
   pinMode(CS_PIN, OUTPUT);
   digitalWrite(CS_PIN, HIGH);
+  pinMode(MISO, INPUT_PULLUP); // Helps stabilize the SPI read line
 
-  driver.begin();             // Initiate pins and registers
+  driver.begin();             
   driver.rms_current(600);    // Set stepper current to 600mA
-  driver.stealthChop(1);      // Enable silent stepping
-  driver.stealth_autoscale(1);
-  driver.microsteps(8);
+  driver.microsteps(16);
 
+  // --- SPI Hardware Communication Diagnostic ---
+  uint8_t conn_status = driver.test_connection();
+  Serial.print("SPI Connection Test Status Code: ");
+  Serial.println(conn_status);
+  if (conn_status == 0) {
+    Serial.println("-> SUCCESS: TMC2130 SPI Read/Write verified!\n");
+  } else {
+    Serial.println("-> ERROR: SPI Read failed! Check SDO/MISO wiring or power.\n");
+  }
+
+  // --- Force Raw Registers for StallGuard (SpreadCycle) ---
+  driver.stealthChop(0);      // Explicitly disables StealthChop -> enables SpreadCycle
+  driver.toff(4);             // Enable driver chopper (TOFF > 0 required)
+  driver.blank_time(24);
+
+  driver.TCOOLTHRS(0xFFFFF);  // Directly sets raw TCOOLTHRS register to max
+  driver.THIGH(0);            // Ensures high-speed mode is disabled
+  driver.sg_stall_value(STALL_VALUE); // Sets sensitivity threshold
+
+  // --- AccelStepper Setup ---
   stepper.setMaxSpeed(50 * steps_per_mm); 
   stepper.setAcceleration(500 * steps_per_mm); 
   stepper.setEnablePin(EN_PIN);
   stepper.setPinsInverted(false, false, true);
   stepper.enableOutputs();
 
+  Serial.println("System Ready!");
   Serial.println("Input data as: <syringe inner diam(mm),flowrate(mL/s),target volume(mL)>\n");
 }
 
@@ -63,22 +87,24 @@ void loop() {
     strcpy(tempChars, receivedChars);
     parseData();
     calculate();
+    isStalled = false; // *** ADD: Reset stall status for new command ***
     runStepper();
 
     showParsedData();
     newData = false;
   }
 
-  if (stepper.distanceToGo() == 0) {
-    stepper.disableOutputs();  
+  if (stepper.distanceToGo() != 0 && !isStalled) {
+    checkStallGuard(); // Poll driver status over SPI
+    stepper.runSpeed();
   } else {
-    stepper.runSpeed(); //run doesnt do at the commanded speed
+    stepper.disableOutputs();  
   }
 }
 
 void runStepper() {
   float targetSteps = pumpLength * steps_per_mm;
-  float speedStepsPerSec = feedrate * steps_per_mm; // Converts mm/s to steps/s
+  float speedStepsPerSec = feedrate * steps_per_mm;
 
   if (targetSteps < 0) {
     speedStepsPerSec = -speedStepsPerSec;
@@ -87,6 +113,8 @@ void runStepper() {
   stepper.move(targetSteps);
   stepper.setSpeed(speedStepsPerSec);
   stepper.enableOutputs();
+
+  moveStartTime = millis(); // Record exact timestamp when movement starts!
 }
 
 void recvWithStartEndMarkers() {
@@ -149,4 +177,29 @@ void showParsedData() {
   Serial.print("pump length (mm): ");
   Serial.println(pumpLength);
   Serial.println();
+}
+
+void checkStallGuard() {
+  if (stepper.speed() == 0) return;
+
+  // REDUCED: Ignore only the first 200ms (0.2 seconds) of movement!
+  if (millis() - moveStartTime < 200) return;
+
+  static uint32_t lastPoll = 0;
+  if (millis() - lastPoll < 100) return; // Poll every 100ms for faster reaction
+  lastPoll = millis();
+
+  uint32_t drv_status = driver.DRV_STATUS();
+  uint16_t sg_result = (drv_status & 0x3FF); 
+  bool is_standstill = (drv_status >> 31) & 0x01; 
+
+  // Fast stall trigger condition
+  if (sg_result < 100 && !is_standstill) {
+    isStalled = true;
+    stepper.stop();
+    stepper.setCurrentPosition(stepper.currentPosition()); 
+    stepper.disableOutputs();
+
+    Serial.println("\n*** STALL DETECTED! MOTOR STOPPED. ***\n");
+  }
 }
